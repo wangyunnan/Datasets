@@ -97,28 +97,30 @@ class RandomAffine(object):
         self.p = p
         self.operations = operations
 
-    def __call__(self, img, soft):
+    def __call__(self, img, lbl, logits):
+        device = img.device
         b, c, h, w = img.shape
-        new_img = []
-        new_soft = []
-        new_mask = []
+        lbl = lbl.float().unsqueeze(1)
 
-        mask = torch.ones((b, 1, h, w)).float().to(img.device)
+        all_theta = []
         for i in range(b):
             theta = torch.eye(n=2, m=3).float().unsqueeze(0)
             if random.random() < self.p:
                 theta = self.random_operation((h, w))
+            all_theta.append(theta)
+        all_theta = torch.cat(all_theta)
 
-            grid = F.affine_grid(theta, img[i].unsqueeze(0).size(), align_corners=True).to(img.device)
-            new_img.append(F.grid_sample(img[i].unsqueeze(0), grid, mode='bilinear', align_corners=True))
-            new_soft.append(F.grid_sample(soft[i].unsqueeze(0), grid, mode='bilinear', align_corners=True))
-            new_mask.append(F.grid_sample(mask[i].unsqueeze(0), grid, mode='nearest', align_corners=True))
+        loss_mask = torch.ones((b, 1, h, w)).float().to(device)
+        grid = F.affine_grid(all_theta, img.size(), align_corners=True).to(device)
 
-        new_img = torch.cat(new_img)
-        new_soft = torch.cat(new_soft)
-        new_mask = torch.cat(new_mask).squeeze(0)
+        new_img = F.grid_sample(img, grid, mode='bilinear', align_corners=True)
+        new_lbl = F.grid_sample(lbl, grid, mode='nearest', align_corners=True).long().squeeze(1)
+        new_logits = F.grid_sample(logits, grid, mode='bilinear', align_corners=True)
+        new_loss_mask = F.grid_sample(loss_mask, grid, mode='nearest', align_corners=True).long().squeeze(1)
 
-        return new_img, new_soft, new_mask
+        new_lbl[(1 - new_loss_mask).bool()] = 255
+
+        return new_img, new_lbl, new_logits, new_loss_mask
 
     def random_operation(self, size):
         h, w = size
@@ -184,28 +186,25 @@ class RandomCutMix(object):
         assert source_logits.shape == target_logits.shape
         device = source_img.device
         b, c, h, w = source_img.shape
+        source_lbl = source_lbl.float().unsqueeze(1)
+        target_lbl = target_lbl.float().unsqueeze(1)
 
-        new_source_img = []
-        new_source_lbl = []
-        new_source_logits = []
-        new_target_img = []
-        new_target_logits = []
+        all_mask = []
         for i in range(b):
-            mix_mask = torch.zeros([h, w]).long().to(device)
+            mix_mask = torch.zeros((h, w)).long().to(device).unsqueeze(0)
             if random.random() < self.p:
-                mix_mask = self.generate_mask([h, w]).to(device)
-            new_source_img.append((source_img[i] * (1.0 - mix_mask) + target_img[i] * mix_mask).unsqueeze(0))
-            new_source_lbl.append((source_lbl[i] * (1.0 - mix_mask) + target_lbl[i] * mix_mask).unsqueeze(0))
-            new_source_logits.append((source_logits[i] * (1.0 - mix_mask) + target_logits[i] * mix_mask).unsqueeze(0))
-            new_target_img.append((target_img[i] * (1.0 - mix_mask) + source_img[i] * mix_mask).unsqueeze(0))
-            new_target_logits.append((target_logits[i] * (1.0 - mix_mask) + source_logits[i] * mix_mask).unsqueeze(0))
+                mix_mask = self.generate_mask((h, w)).to(device).unsqueeze(0)
+            all_mask.append(mix_mask)
+        all_mask = torch.cat(all_mask).unsqueeze(1)
+        new_source_img = source_img * (1.0 - all_mask) + target_img * all_mask
+        new_source_lbl = source_lbl * (1.0 - all_mask) + target_lbl * all_mask
+        new_source_logits = source_logits * (1.0 - all_mask) + target_logits * all_mask
+        new_target_img = target_img * (1.0 - all_mask) + source_img * all_mask
+        new_target_lbl = target_lbl * (1.0 - all_mask) + source_lbl * all_mask
+        new_target_logits = target_logits * (1.0 - all_mask) + source_logits * all_mask
 
-        new_source_img = torch.cat(new_source_img)
-        new_source_lbl = torch.cat(new_source_lbl)
-        new_source_logits =torch.cat(new_source_logits)
-        new_target_img = torch.cat(new_target_img)
-        new_target_logits = torch.cat(new_target_logits)
-        return new_source_img, new_source_lbl.long(), new_source_logits, new_target_img, new_target_logits
+        return new_source_img, new_source_lbl.long().squeeze(1), new_source_logits, \
+               new_target_img, new_target_lbl.long().squeeze(1), new_target_logits
 
     def generate_mask(self, img_size, ratio=2):
         cutout_area = img_size[0] * img_size[1] / ratio
